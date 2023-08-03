@@ -1,246 +1,4 @@
-# Issue H-1: Blocklisted address or address(0) recipient can lock protocol fund when order is partially filled 
-
-Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/55 
-
-## Found by 
-ctf\_sec, hals
-## Summary
-
-Blocklisted address or address(0) recipient can lock protocol fund when order is partially filled
-
-## Vulnerability Detail
-
-When creating the order, the asset token and payment token is whitelited and validated
-
-```solidity
-   function requestOrder(OrderRequest calldata orderRequest, bytes32 salt) public nonReentrant whenOrdersNotPaused {
-        // Reject spam orders
-        if (orderRequest.quantityIn == 0) revert ZeroValue();
-        // Check for whitelisted tokens
-        _checkRole(ASSETTOKEN_ROLE, orderRequest.assetToken);
-        _checkRole(PAYMENTTOKEN_ROLE, orderRequest.paymentToken);
-        bytes32 orderId = getOrderIdFromOrderRequest(orderRequest, salt);
-        // Order must not already exist
-        if (_orders[orderId].remainingOrder > 0) revert DuplicateOrder();
-
-        // Get order from request and move tokens
-        Order memory order = _requestOrderAccounting(orderRequest, orderId);
-
-        // Send order to bridge
-        emit OrderRequested(orderId, order.recipient, order, salt);
-
-        // Initialize order state
-        uint256 orderAmount = order.sell ? order.assetTokenQuantity : order.paymentTokenQuantity;
-        _orders[orderId] = OrderState({requester: msg.sender, remainingOrder: orderAmount, received: 0});
-        _numOpenOrders++;
-    }
-
-```
-
-but the order.recipient is never validated
-
-the payment token can be USDC and support blocklist, the user can set order.recipient to a blocked token address
-
-the user can also set the recipient address to address(0)
-
-then later when the operator want to fill in the order
-
-when order is partially filled, the transaction proceeded, the share is burned and the payment token is transferred in the OrderProcessor contract
-
-```solidity
-
-    /// @inheritdoc OrderProcessor
-    function _fillOrderAccounting(
-        OrderRequest calldata orderRequest,
-        bytes32 orderId,
-        OrderState memory orderState,
-        uint256 fillAmount,
-        uint256 receivedAmount
-    ) internal virtual override {
-        // Accumulate fee obligations at each sill then take all at end
-        uint256 collection = getPercentageFeeForOrder(receivedAmount);
-        uint256 feesEarned = _feesEarned[orderId] + collection;
-        // If order completely filled, clear fee data
-        uint256 remainingOrder = orderState.remainingOrder - fillAmount;
-        if (remainingOrder == 0) {
-            // Clear fee state
-            delete _feesEarned[orderId];
-        } else {
-            // Update fee state with earned fees
-            if (collection > 0) {
-                _feesEarned[orderId] = feesEarned;
-            }
-        }
-
-        // Burn asset
-        IMintBurn(orderRequest.assetToken).burn(fillAmount);
-        // Transfer raw proceeds of sale here
-        IERC20(orderRequest.paymentToken).safeTransferFrom(msg.sender, address(this), receivedAmount);
-        // Distribute if order completely filled
-        if (remainingOrder == 0) {
-            _distributeProceeds(
-                orderRequest.paymentToken, orderRequest.recipient, orderState.received + receivedAmount, feesEarned
-            );
-        }
-    }
-```
-
-note the code section:
-
-```solidity
-   // Burn asset
-        IMintBurn(orderRequest.assetToken).burn(fillAmount);
-        // Transfer raw proceeds of sale here
-        IERC20(orderRequest.paymentToken).safeTransferFrom(msg.sender, address(this), receivedAmount);
-        // Distribute if order completely filled
-        if (remainingOrder == 0) {
-            _distributeProceeds(
-                orderRequest.paymentToken, orderRequest.recipient, orderState.received + receivedAmount, feesEarned
-            );
-        }
-```
-
-only if the remaining order is 0, meaning when the order is fully filled, the payment token is distributed
-
-However, even when the order is filled, and when calling _distributeProceeds, transaction still revert because the order.recipient is a blocklisted addres or address(0)
-
-```solidity
-   function _distributeProceeds(address paymentToken, address recipient, uint256 totalReceived, uint256 feesEarned)
-        private
-    {
-        // Check if accumulated fees are larger than total received
-        uint256 proceeds = 0;
-        uint256 collection = 0;
-        if (totalReceived > feesEarned) {
-            // Take fees from total received before distributing
-            proceeds = totalReceived - feesEarned;
-            collection = feesEarned;
-        } else {
-            // If accumulated fees are larger than total received, then no proceeds go to recipient
-            collection = totalReceived;
-        }
-
-        // Transfer proceeds to recipient
-        if (proceeds > 0) {
-            IERC20(paymentToken).safeTransfer(recipient, proceeds);
-        }
-        // Transfer fees to treasury
-        if (collection > 0) {
-            IERC20(paymentToken).safeTransfer(treasury, collection);
-        }
-    }
-```
-
-transaction revert when calling this [line of code](https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L171)
-
-```solidity
- IERC20(paymentToken).safeTransfer(recipient, proceeds);
-```
-
-there is just no way for protocol to get the fund back because even when canceling the order,
-
- transaction still revert in this [line of code](https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L171)
- because _distributeProceeds when there are partially fill order
- 
-```solidity
-    /// @inheritdoc OrderProcessor
-    function _cancelOrderAccounting(OrderRequest calldata orderRequest, bytes32 orderId, OrderState memory orderState)
-        internal
-        virtual
-        override
-    {
-        // If no fills, then full refund
-        uint256 refund;
-        if (orderState.remainingOrder == orderRequest.quantityIn) {
-            // Full refund
-            refund = orderRequest.quantityIn;
-        } else {
-            // Otherwise distribute proceeds, take accumulated fees, and refund remaining order
-            _distributeProceeds(
-                orderRequest.paymentToken, orderRequest.recipient, orderState.received, _feesEarned[orderId]
-            );
-            // Partial refund
-            refund = orderState.remainingOrder;
-        }
-
-        // Clear fee data
-        delete _feesEarned[orderId];
-
-        // Return escrow
-        IERC20(orderRequest.assetToken).safeTransfer(orderRequest.recipient, refund);
-    }
-```
-
-note, if this line of code:
-
-```solidity
-  // Return escrow
-        IERC20(orderRequest.assetToken).safeTransfer(orderRequest.recipient, refund);
-```
-
-if the orderRequest.recipient address is a blocklisted address by dShares transferRestrictor, the transaction revert as well, blocking order canceling.
- 
-## Impact
-
-Blocklisted address or address(0) recipient can lock protocol fund when order is partially filled
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/BuyOrderIssuer.sol#L214
-
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L171
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-We recommend the protocol validate the recipient address to not let user set a blocklisted address or address(0)
-
-
-
-## Discussion
-
-**jaketimothy**
-
-Agree and would argue further that even with an initial check, a user could be added to blocklist after order placement but before fulfillment, creating an unrecoverable state for that order as refunds would be blocked. Not sure how to handle that..
-
-**ctf-sec**
-
-I think when cancel the order, instead of pushing the fund to receiver, can let receiver claim the fund, if after a certain period and the receiver does not claim the fund, 
-
-the protocol can help them claim the fund, we assume the protocol admin msg.sender will not be blocklisted
-
-Also, I think when creating the order, it is ok to validate the receiver address is not address(0)
-
-**ctf-sec**
-
-@Oot2k 
-
-My empathy for judge is high, but I want to suggest an alternative way to de-duplicate the issue.
-
-I don't think #113 and #136 is a duplicate of this issue
-
-they only say order cancellation will revert.
-
-In buy order, this is not a problem, if a user use a blocklist address or address(0) as a recipient, he lock his own payout token, no loss of fund from protocol.
-
-The impact of not able to cancel or fill order on protocol is the operator are force to waste gas by executing transaction can fail.
-
-Only combining with the partially filled order, the blocklist recipient address becomes a problem, any partially filled payment token in sell order are lost forever
-
-I suggest we can separate #113 and #136 and create a separate medium, in fact, the new medium can be grouped with #57 and #46 and #112
-
-report #46 mentioned the waste gas issue but no partially fill, report 112 mention waste gas and blacklist
-
-report #46 mention
-
-> the order will therefore be stuck inside the contract.
-
-the explanation is vague and not clear, I find it difficult to interpret the sentence as lock fund and it make sense to interpret it as "order cannot be filled".... if the auditor changed the term from "order" to "fund", I will strongly suggest issue 46 is a duplicate of this one, but in this case, a duplication with the newly created medium seems very reaonsable...
-
-# Issue H-2: Bypass the blacklist restriction because the blacklist check is not done when minting or burning 
+# Issue H-1: Bypass the blacklist restriction because the blacklist check is not done when minting or burning 
 
 Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/64 
 
@@ -328,11 +86,33 @@ do not let blacklisted address create buy order and sell order
 
 
 
+
 ## Discussion
 
 **jaketimothy**
 
 Fixes for this should be considered in combination with #55 as it creates more opportunities for locking up orders.
+
+**jaketimothy**
+
+Fixed in 
+- https://github.com/dinaricrypto/sbt-contracts/pull/126
+- https://github.com/dinaricrypto/sbt-contracts/pull/131
+
+**ctf-sec**
+
+PR #131 fix goods good
+
+PR #126 only fix only check if the recipient or requestor is blocklisted by the asset token transferRestrictor
+
+```solidity
+  if (
+            BridgedERC20(orderRequest.assetToken).isBlacklisted(orderRequest.recipient)
+                || BridgedERC20(orderRequest.assetToken).isBlacklisted(msg.sender)
+        ) revert Blacklist();
+``` 
+
+the protocol may want to consider checking if the orderRequest.recipient or msg.sender is blocklisted by the payment token as well
 
 # Issue M-1: In case of stock split and reverse split, the Dshare token holder will gain or loss his Dshare token value 
 
@@ -429,12 +209,123 @@ but since the admin can't actually burn for user,
 
 this can be valid medium, severity is definitely not high :)
 
+**thangtranth**
+
+Escalate
+
+I believe this issue is a high severity because:
+
+- Impact: As the sponsor mentioned, the impact is catastrophic if unaddressed. It breaks the invariant 1 share : 1 token of the protocol. Some token holders will unfairly lose/gain X times the value. In addition, protocols that integrate with Dinari will have problems. It is not considered an acceptable risk
+
+- Frequency: Stock splits and reverse splits are very common events. Because Dinari covers many publicly traded securities, not just one stock, the frequency of the events should be counted using the whole stock market, not frequency of one stock. There are events happening every month. https://www.marketbeat.com/stock-splits/history/
+
+- The mechanism that the sponsor mentioned was not available anywhere during the contest: from the contest README to the white paper. It is new information that came after the contest was finished.
+
+- As the lead Watson pointed out, even the workaround of owner minting and burning directly to users does not work, because the admin cannot burn other users’ tokens. And I don’t think using the mint and burn functions in the token contract and minting manually to each user is a good solution.
+
+**sherlock-admin**
+
+ > Escalate
+> 
+> I believe this issue is a high severity because:
+> 
+> - Impact: As the sponsor mentioned, the impact is catastrophic if unaddressed. It breaks the invariant 1 share : 1 token of the protocol. Some token holders will unfairly lose/gain X times the value. In addition, protocols that integrate with Dinari will have problems. It is not considered an acceptable risk
+> 
+> - Frequency: Stock splits and reverse splits are very common events. Because Dinari covers many publicly traded securities, not just one stock, the frequency of the events should be counted using the whole stock market, not frequency of one stock. There are events happening every month. https://www.marketbeat.com/stock-splits/history/
+> 
+> - The mechanism that the sponsor mentioned was not available anywhere during the contest: from the contest README to the white paper. It is new information that came after the contest was finished.
+> 
+> - As the lead Watson pointed out, even the workaround of owner minting and burning directly to users does not work, because the admin cannot burn other users’ tokens. And I don’t think using the mint and burn functions in the token contract and minting manually to each user is a good solution.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**ctf-sec**
+
+> Escalate
+> 
+> I believe this issue is a high severity because:
+> 
+> * Impact: As the sponsor mentioned, the impact is catastrophic if unaddressed. It breaks the invariant 1 share : 1 token of the protocol. Some token holders will unfairly lose/gain X times the value. In addition, protocols that integrate with Dinari will have problems. It is not considered an acceptable risk
+> * Frequency: Stock splits and reverse splits are very common events. Because Dinari covers many publicly traded securities, not just one stock, the frequency of the events should be counted using the whole stock market, not frequency of one stock. There are events happening every month. https://www.marketbeat.com/stock-splits/history/
+> * The mechanism that the sponsor mentioned was not available anywhere during the contest: from the contest README to the white paper. It is new information that came after the contest was finished.
+> * As the lead Watson pointed out, even the workaround of owner minting and burning directly to users does not work, because the admin cannot burn other users’ tokens. And I don’t think using the mint and burn functions in the token contract and minting manually to each user is a good solution.
+
+I find it difficult to think this is a high severity issue, stock just don't split every day. How does the sponsor handle the stock split is not in scope of auditing, severity at most medium if not out of scope, we could say, if the stock company rug and delisted, all dShare lose its value... this is expected, which is not in scope of the auditing as well
+
+https://docs.sherlock.xyz/audits/judging/judging
+
+> Medium: There is a viable scenario (even if unlikely) that could cause the protocol to enter a state where a material amount of funds can be lost. The attack path is possible with assumptions that either mimic on-chain conditions or reflect conditions that have a reasonable chance of becoming true in the future.
+
+and
+
+> As the lead Watson pointed out, even the workaround of owner minting and burning directly to users does not work, because the admin cannot burn other users’ tokens. And I don’t think using the mint and burn functions in the token contract and minting manually to each user is a good solution
+
+there is no mention about this in the original report
+
+and
+
+I really feel like not dispute as low and out of scope and argue a medium is already what I can do the best for this report because this report does show creativity. 
+
+https://www.marketplace.org/2022/02/11/whats-a-stock-split-anyway/
+
+![image](https://github.com/sherlock-audit/2023-06-dinari-judging/assets/114844362/f7cbfb19-457f-4dc4-93bb-162f71831e55)
+
+
+
+
+
+
+**ctf-sec**
+
+btw the while the resolving the escalation is one story, the fix is another.
+
+@jaketimothy 
+
+Maybe can use this
+
+https://docs.openzeppelin.com/contracts/3.x/api/token/erc20#ERC20Snapshot
+
+Implement as rebasing token to modify the ERC20 token balance can help as well!
+
+Agree this is not a easy fix.
+
+**jaketimothy**
+
+Thank you for sharing @ctf-sec. I'm racking my brain trying to avoid rebasing token. 
+
+**Oot2k**
+
+Stocksplits are known well in advance, so trading can be haltet and shares converted. I still think all offchain fixes are not recommended which means this is a valid medium issue. 
+
+**jaketimothy**
+
+Fixed in 
+- https://github.com/dinaricrypto/sbt-contracts/pull/135
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+Given that this is an external condition that is well-known beforehand. This issue can be fairly considered a valid medium because the code cannot handle the stock-split situation and the off-chain/on-chain solutions were not previously present. 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [thangtranth](https://github.com/sherlock-audit/2023-06-dinari-judging/issues/29/#issuecomment-1630988049): rejected
+
 # Issue M-2: Escrow record not cleared on cancellation and order fill 
 
 Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/56 
 
 ## Found by 
-Delvir0, bin2chen, bitsurfer, chainNue, ctf\_sec, dirk\_y, hals
+Delvir0, bin2chen, bitsurfer, chainNue, ctf\_sec, dirk\_y, hals, volodya
 ## Summary
 In `DirectBuyIssuer.sol`, a market buy requires the operator to take the payment token as escrow prior to filling the order. Checks are in place so that the math works out in terms of how much escrow has been taken vs the order's remaining fill amount. However, if the user cancels the order or fill the order, the escrow record is not cleared. 
 
@@ -527,137 +418,22 @@ Manual Review
 ## Recommendation
 Clear the escrow record upon canceling the order.
 
-# Issue M-3: Blocklisted recipient or address(0) force operator to waste gas when filling the sell order or filling the cancel order 
 
-Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/57 
 
-## Found by 
-0xMosh, Avci, auditsea, ctf\_sec, shogoki
-## Summary
+## Discussion
 
-Blocklisted recipient or address(0) force operator to waste gas when filling the order
+**jaketimothy**
 
-## Vulnerability Detail
+Fixed in 
+- https://github.com/dinaricrypto/sbt-contracts/pull/122
 
-When creating the order, the asset token and payment token is whitelited and validated
+**ctf-sec**
 
-```solidity
-   function requestOrder(OrderRequest calldata orderRequest, bytes32 salt) public nonReentrant whenOrdersNotPaused {
-        // Reject spam orders
-        if (orderRequest.quantityIn == 0) revert ZeroValue();
-        // Check for whitelisted tokens
-        _checkRole(ASSETTOKEN_ROLE, orderRequest.assetToken);
-        _checkRole(PAYMENTTOKEN_ROLE, orderRequest.paymentToken);
-        bytes32 orderId = getOrderIdFromOrderRequest(orderRequest, salt);
-        // Order must not already exist
-        if (_orders[orderId].remainingOrder > 0) revert DuplicateOrder();
+The fix reset the escrow balance after cancelling
 
-        // Get order from request and move tokens
-        Order memory order = _requestOrderAccounting(orderRequest, orderId);
+the protocol may want to consider handling the escrow accounting properly when the order is filled as well (such as reset the escrow balance to 0)
 
-        // Send order to bridge
-        emit OrderRequested(orderId, order.recipient, order, salt);
-
-        // Initialize order state
-        uint256 orderAmount = order.sell ? order.assetTokenQuantity : order.paymentTokenQuantity;
-        _orders[orderId] = OrderState({requester: msg.sender, remainingOrder: orderAmount, received: 0});
-        _numOpenOrders++;
-    }
-
-```
-
-but the order.recipient is never validated
-
-the payment token can be USDC and support blocklist, the user can set order.recipient to a blocked token address
-
-the user can also set the recipient address to address(0)
-
-then later when the operator want to fill in the order
-
-the operator are force to waste gas and the order filling transaction keep reverting because the recipient cannot receive the payment token in Sell Order
-
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L171
-
-```solidity
-    function _distributeProceeds(address paymentToken, address recipient, uint256 totalReceived, uint256 feesEarned)
-        private
-    {
-        // Check if accumulated fees are larger than total received
-        uint256 proceeds = 0;
-        uint256 collection = 0;
-        if (totalReceived > feesEarned) {
-            // Take fees from total received before distributing
-            proceeds = totalReceived - feesEarned;
-            collection = feesEarned;
-        } else {
-            // If accumulated fees are larger than total received, then no proceeds go to recipient
-            collection = totalReceived;
-        }
-
-        // Transfer proceeds to recipient
-        if (proceeds > 0) {
-            IERC20(paymentToken).safeTransfer(recipient, proceeds);
-        }
-        // Transfer fees to treasury
-        if (collection > 0) {
-            IERC20(paymentToken).safeTransfer(treasury, collection);
-        }
-    }
-```
-
-In BuyOrder
-
-User can send a tiny amount of payment and then call cancel order
-
-the operator is expected to help user cancel order, but when he doing so, the gas is wasted because the transaction would keep reverting because the recipient address is blocklisted or address(0)
-
-[here](https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/BuyOrderIssuer.sol#L214)
-
-## Impact
-
-Blocklisted recipient or address(0) force operator to waste gas when filling the sell order or filling the cancel order
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/BuyOrderIssuer.sol#L214
-
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L171
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-We recommend the protocol validate the recipient address to not let user set a blocklisted address or address(0)
-
-# Issue M-4: The percentage fee can vary during the life of a sell order 
-
-Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/58 
-
-## Found by 
-ctf\_sec
-## Summary
-Sell orders can be filled partially. Upon each partial fill, the percentage fee is calculated based on the current fee percentage set in the `OrderFees.sol` contract. Therefore, any change to the percentage fee rate retroactively applies to all active sell orders.
-
-## Vulnerability Detail
-Buy orders do not suffer from this issue, as they have the percentage fee taken out upon requesting the order. This ensures that future changes to the percentage fee rate do not affect active orders.
-
-A user can create a sell order while the percentage fee is **1%**. If Dinari changes it so that the percentage fee is now **10%**, then it will apply to the already active order.
-
-## Impact
-- Users will be exposed to different percentage fees than expected when requesting the order
-
-## Code Snippet
-https://github.com/sherlock-audit/2023-06-dinari/blob/4851cb7ebc86a7bc26b8d0d399a7dd7f9520f393/sbt-contracts/src/issuer/SellOrderProcessor.sol#L92-L101
-
-## Tool used
-Manual Review
-
-## Recommendation
-The percentage fee rate should be stamped when the sell order is requested. Future changes to the current percentage fee should not affect existing orders.
-
-# Issue M-5: Cancellation refunds should return tokens to order creator, not recipient 
+# Issue M-3: Cancellation refunds should return tokens to order creator, not recipient 
 
 Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/61 
 
@@ -713,31 +489,46 @@ Manual Review
 ## Recommendation
 Return the funds to the order creator, not the recipient.
 
-# Issue M-6: `orderId` needs to be unique 
 
-Source: https://github.com/sherlock-audit/2023-06-dinari-judging/issues/106 
 
-## Found by 
-0xpinky, auditsea, seerether, tnquanghuy0512
-## Summary
-`orderId` can be duplicated, which will cause issues on off-chain operating service.
+## Discussion
 
-## Vulnerability Detail
-`orderId` is generated from `orderRequest` and `salt` both given by a user, it means there can be multiple orders with same `orderId` that can cause some problems on off-chain operating service.(Even though there is only one active order with one orderId)
+**bizzyvinci**
 
-## Impact
-This will cause some problems on off-chain operating service, especially when `orderId` is used as a primary key of database used by off-chain operating service. For example:
+Escalate
 
-1. `requestCancel` would cause confusions to the off-chain operating service. When a user creates an order and tries to cancel it, but let's say requestCancel is called twice by a mistake, off-chain service cancels the order, and after a delay, off-chain service tries to handle 2nd cancellation event. If user creates a same order between two cancellation events, 2nd order will also be cancelled even though both cancellation events were for the first order.
-2. When `orderId` is used as a primary key on off-chain database, user's order history with same fields will not be recorded, causing lose of history.
+This issue ought to be high because it doesn't require external conditions or specific states for users to lose a significant amount.
+It is very likely that `msg.sender != recipient` cause msg.sender and recipient could be different entities trying to have a deal either EOA-EOA or contract-EOA or contract-contract. Canceling order is meant to be a **perfect unwind** as mentioned by the sponsor.
 
-## Code Snippet
-https://github.com/sherlock-audit/2023-06-dinari/blob/main/sbt-contracts/src/issuer/OrderProcessor.sol#L244-L264
+This issue affects every single cancelled order, both buy, direct buy and sell orders.
 
-## Tool used
+<img width="822" alt="Screenshot 2023-07-11 at 13 56 06" src="https://github.com/sherlock-audit/2023-06-dinari-judging/assets/22333930/7131c7ec-eb1f-4b07-80d5-ef450c80736a">
 
-Manual Review
 
-## Recommendation
-Use randomly on-chain generated salt (not recommended) or implement user nonce that increases whenever orders are created.
+**sherlock-admin**
+
+> Escalate
+> 
+> This issue ought to be high because it doesn't require external conditions or specific states for users to lose a significant amount.
+> It is very likely that `msg.sender != recipient` cause msg.sender and recipient could be different entities trying to have a deal either EOA-EOA or contract-EOA or contract-contract. Canceling order is meant to be a **perfect unwind** as mentioned by the sponsor.
+> 
+> This issue affects every single cancelled order, both buy, direct buy and sell orders.
+> 
+> <img width="822" alt="Screenshot 2023-07-11 at 13 56 06" src="https://github.com/sherlock-audit/2023-06-dinari-judging/assets/22333930/7131c7ec-eb1f-4b07-80d5-ef450c80736a">
+> 
+
+The escalation could not be created because you are not exceeding the escalation threshold.
+
+You can view the required number of additional valid issues/judging contest payouts in your Profile page,
+in the [Sherlock webapp](https://app.sherlock.xyz/audits/).
+
+
+**jaketimothy**
+
+Fixed in 
+- https://github.com/dinaricrypto/sbt-contracts/pull/117
+
+**ctf-sec**
+
+Fix looks good
 
